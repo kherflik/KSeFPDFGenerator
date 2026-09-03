@@ -1,0 +1,966 @@
+name: Build KSeF PDF Generator - main
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+
+  # ============================================================
+  # CHECK
+  # ============================================================
+
+  check:
+    runs-on: ubuntu-latest
+
+    outputs:
+      sha: ${{ steps.generator.outputs.sha }}
+      should_build: ${{ steps.release.outputs.should_build }}
+
+    steps:
+
+      - name: Get latest generator SHA
+        id: generator
+        shell: bash
+        run: |
+          SHA=$(git ls-remote \
+            https://github.com/CIRFMF/ksef-pdf-generator.git \
+            refs/heads/main | cut -f1)
+
+          if [ -z "$SHA" ]; then
+            echo "Cannot determine generator SHA"
+            exit 1
+          fi
+
+          echo "Generator SHA: $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+
+      - name: Check release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.generator.outputs.sha }}
+        run: |
+          TAG="build-$SHA"
+
+          if gh release view "$TAG" \
+            --repo "${{ github.repository }}" \
+            >/dev/null 2>&1; then
+
+            echo "Release already exists: $TAG"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "New generator version: $TAG"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+          fi
+
+
+  # ============================================================
+  # BUILD
+  # ============================================================
+
+  build:
+    needs: check
+
+    if: |
+      needs.check.outputs.should_build == 'true' ||
+      github.event_name == 'workflow_dispatch'
+
+    runs-on: windows-latest
+
+    steps:
+
+      # ==========================================================
+      # Checkout
+      # ==========================================================
+
+      - name: Checkout ksef-client-csharp
+        uses: actions/checkout@v4
+        with:
+          repository: CIRFMF/ksef-client-csharp
+          ref: main
+          path: ksef-client-csharp
+          submodules: recursive
+          fetch-depth: 1
+
+
+      # ==========================================================
+      # Node.js used ONLY during build
+      # ==========================================================
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+
+      - name: Get Node.js version
+        id: node
+        shell: pwsh
+        run: |
+          $version = node -p "process.versions.node"
+
+          Write-Host "Node.js used for build: $version"
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+
+      # ==========================================================
+      # Checkout exact generator commit
+      # ==========================================================
+
+      - name: Checkout generator commit
+        shell: pwsh
+        working-directory: ksef-client-csharp
+        env:
+          GENERATOR_SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          $generator =
+            "KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator"
+
+          Write-Host "Generator SHA:"
+          Write-Host $env:GENERATOR_SHA
+
+          git -C $generator fetch origin $env:GENERATOR_SHA
+
+          git -C $generator checkout $env:GENERATOR_SHA
+
+          Write-Host "Checked out:"
+          git -C $generator rev-parse HEAD
+
+
+      # ==========================================================
+      # Install npm dependencies
+      # ==========================================================
+
+      - name: Install generator dependencies
+        shell: pwsh
+        working-directory: ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator
+        run: |
+          npm ci
+
+
+      # ==========================================================
+      # Build PDF generator
+      # ==========================================================
+
+      - name: Build PDF generator
+        shell: pwsh
+        working-directory: ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator
+        run: |
+          npm run build
+
+
+      # ==========================================================
+      # Verify generator
+      # ==========================================================
+
+      - name: Verify generator
+        shell: pwsh
+        run: |
+          $generator =
+            "ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator"
+
+          $required = @(
+            "$generator\package.json",
+            "$generator\package-lock.json",
+            "$generator\node_modules",
+            "$generator\node_modules\pdfmake",
+            "$generator\dist",
+            "$generator\dist\ksef-fe-invoice-converter.js",
+            "$generator\assets\invoice.xml"
+          )
+
+          foreach ($path in $required) {
+
+            if (!(Test-Path $path)) {
+              throw "Missing: $path"
+            }
+
+            Write-Host "[OK] $path"
+          }
+
+
+      # ==========================================================
+      # Patch Program.cs
+      # ==========================================================
+
+      - name: Patch Program.cs
+        shell: pwsh
+        run: |
+          $program =
+            "ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Program.cs"
+
+          $content = Get-Content $program -Raw
+
+
+          # ------------------------------------------------------
+          # Use application directory
+          # ------------------------------------------------------
+
+          $old =
+            'string projectDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", ".."));'
+
+          if (!$content.Contains($old)) {
+            throw "Original projectDir line not found in Program.cs"
+          }
+
+          $replacement =
+            'string projectDir = AppContext.BaseDirectory;'
+
+          $content = $content.Replace(
+            $old,
+            $replacement
+          )
+
+
+          # ------------------------------------------------------
+          # Optional bundled Node.js
+          #
+          # Normal package:
+          #   .\node\node.exe does not exist
+          #   -> system Node.js from PATH
+          #
+          # Portable package:
+          #   .\node\node.exe exists
+          #   -> bundled Node.js
+          # ------------------------------------------------------
+
+          $nodeCode = @(
+            '',
+            '// Use bundled Node.js when available.',
+            'string nodeDir = Path.Combine(AppContext.BaseDirectory, "node");',
+            'string currentPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;',
+            '',
+            'if (Directory.Exists(nodeDir))',
+            '{',
+            '    Environment.SetEnvironmentVariable(',
+            '        "PATH",',
+            '        nodeDir + Path.PathSeparator + currentPath);',
+            '}'
+          ) -join [Environment]::NewLine
+
+          $content = $content.Replace(
+            $replacement,
+            $replacement + $nodeCode
+          )
+
+
+          # ------------------------------------------------------
+          # Rename application in usage/help
+          # ------------------------------------------------------
+
+          $content = $content.Replace(
+            'KSeF.Client.Tests.PdfTestApp',
+            'KSeFPDFGenerator'
+          )
+
+
+          Set-Content `
+            -Path $program `
+            -Value $content `
+            -Encoding UTF8
+
+          Write-Host "Program.cs patched successfully."
+
+
+      # ==========================================================
+      # .NET
+      # ==========================================================
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+
+      # ==========================================================
+      # Restore
+      # ==========================================================
+
+      - name: Restore .NET
+        shell: pwsh
+        run: |
+          dotnet restore `
+            ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\KSeF.Client.Tests.PdfTestApp.csproj
+
+
+      # ==========================================================
+      # Publish
+      # ==========================================================
+
+      - name: Publish application
+        shell: pwsh
+        run: |
+          dotnet publish `
+            ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\KSeF.Client.Tests.PdfTestApp.csproj `
+            -c Release `
+            -f net10.0 `
+            -r win-x64 `
+            --self-contained true `
+            -o publish
+
+
+      # ==========================================================
+      # Rename EXE
+      # ==========================================================
+
+      - name: Rename application
+        shell: pwsh
+        run: |
+          $exe =
+            "publish\KSeF.Client.Tests.PdfTestApp.exe"
+
+          if (!(Test-Path $exe)) {
+            throw "Published EXE not found"
+          }
+
+          Rename-Item `
+            $exe `
+            "KSeFPDFGenerator.exe"
+
+
+      # ==========================================================
+      # Copy wrapper
+      # ==========================================================
+
+      - name: Copy PDF wrapper
+        shell: pwsh
+        run: |
+          Copy-Item `
+            "ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\generate-pdf-wrapper.mjs" `
+            "publish\generate-pdf-wrapper.mjs" `
+            -Force
+
+
+      # ==========================================================
+      # Copy generator
+      # ==========================================================
+
+      - name: Copy PDF generator
+        shell: pwsh
+        run: |
+          $source =
+            "ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator"
+
+          $target =
+            "publish\Externals\ksef-pdf-generator"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $target `
+            -Force | Out-Null
+
+          Copy-Item `
+            "$source\*" `
+            $target `
+            -Recurse `
+            -Force
+
+
+      # ==========================================================
+      # Verify Node.js available for NORMAL package
+      # ==========================================================
+
+      - name: Verify system Node.js
+        shell: pwsh
+        run: |
+          Write-Host "Node.js from PATH:"
+
+          node --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Node.js is not available in PATH"
+          }
+
+
+      # ==========================================================
+      # Verify NORMAL package
+      # ==========================================================
+
+      - name: Verify normal package
+        shell: pwsh
+        run: |
+          $required = @(
+            "publish\KSeFPDFGenerator.exe",
+            "publish\generate-pdf-wrapper.mjs",
+            "publish\Externals\ksef-pdf-generator\package.json",
+            "publish\Externals\ksef-pdf-generator\node_modules",
+            "publish\Externals\ksef-pdf-generator\dist\ksef-fe-invoice-converter.js",
+            "publish\Externals\ksef-pdf-generator\assets\invoice.xml"
+          )
+
+          foreach ($path in $required) {
+
+            if (!(Test-Path $path)) {
+              throw "Missing: $path"
+            }
+
+            Write-Host "[OK] $path"
+          }
+
+          if (Test-Path "publish\node\node.exe") {
+            throw "Normal package must NOT contain Node.js"
+          }
+
+          Write-Host "[OK] Normal package does not contain bundled Node.js"
+
+
+      # ==========================================================
+      # Test NORMAL package
+      # ==========================================================
+
+      - name: Test normal package
+        shell: pwsh
+        run: |
+          $testDir =
+            Join-Path $env:RUNNER_TEMP "ksef-pdf-test-normal"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $testDir `
+            -Force | Out-Null
+
+
+          $sourceXml =
+            "publish\Externals\ksef-pdf-generator\assets\invoice.xml"
+
+          $xml =
+            Join-Path $testDir "invoice.xml"
+
+          Copy-Item `
+            $sourceXml `
+            $xml `
+            -Force
+
+
+          $exe =
+            (Resolve-Path "publish\KSeFPDFGenerator.exe").Path
+
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "Testing NORMAL package"
+          Write-Host "=========================================="
+
+          Write-Host "Node.js from PATH:"
+          node --version
+
+
+          Push-Location publish
+
+          try {
+
+            & $exe "faktura" $xml
+
+            $exitCode = $LASTEXITCODE
+
+          }
+          finally {
+
+            Pop-Location
+
+          }
+
+
+          Write-Host "Exit code: $exitCode"
+
+          if ($exitCode -ne 0) {
+            throw "Normal KSeFPDFGenerator failed with exit code $exitCode"
+          }
+
+
+          $pdf =
+            Join-Path $testDir "invoice.pdf"
+
+
+          if (!(Test-Path $pdf)) {
+            throw "Normal package did not generate PDF"
+          }
+
+
+          $file = Get-Item $pdf
+
+          Write-Host "PDF:"
+          Write-Host $file.FullName
+
+          Write-Host "Size:"
+          Write-Host "$($file.Length) bytes"
+
+
+          if ($file.Length -lt 1000) {
+            throw "PDF is suspiciously small"
+          }
+
+
+          $bytes =
+            [System.IO.File]::ReadAllBytes($pdf)
+
+
+          if ($bytes.Length -lt 5) {
+            throw "PDF is too small"
+          }
+
+
+          $header =
+            [System.Text.Encoding]::ASCII.GetString(
+              $bytes,
+              0,
+              5
+            )
+
+
+          Write-Host "Header: $header"
+
+
+          if ($header -ne "%PDF-") {
+            throw "Invalid PDF header: $header"
+          }
+
+
+          Write-Host ""
+          Write-Host "NORMAL PACKAGE TEST PASSED"
+
+
+      # ==========================================================
+      # Upload NORMAL test PDF
+      # ==========================================================
+
+      - name: Upload normal test PDF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-pdf-normal
+          path: ${{ runner.temp }}/ksef-pdf-test-normal/invoice.pdf
+          if-no-files-found: warn
+
+
+      # ==========================================================
+      # Create PORTABLE directory
+      # ==========================================================
+
+      - name: Create portable package directory
+        shell: pwsh
+        run: |
+          if (Test-Path "portable") {
+            Remove-Item `
+              "portable" `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path "portable" `
+            -Force | Out-Null
+
+          Copy-Item `
+            "publish\*" `
+            "portable" `
+            -Recurse `
+            -Force
+
+
+      # ==========================================================
+      # Download Node.js for PORTABLE package
+      # ==========================================================
+
+      - name: Download portable Node.js
+        shell: pwsh
+        env:
+          NODE_VERSION: ${{ steps.node.outputs.version }}
+        run: |
+          $version = $env:NODE_VERSION
+
+          Write-Host "Downloading Node.js $version"
+
+
+          $url =
+            "https://nodejs.org/dist/v$version/node-v$version-win-x64.zip"
+
+          $zip =
+            Join-Path $env:RUNNER_TEMP "node.zip"
+
+          $extract =
+            Join-Path $env:RUNNER_TEMP "node-extract"
+
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $zip
+
+
+          if (Test-Path $extract) {
+
+            Remove-Item `
+              $extract `
+              -Recurse `
+              -Force
+
+          }
+
+
+          Expand-Archive `
+            $zip `
+            $extract
+
+
+          $nodeExe =
+            Get-ChildItem `
+              $extract `
+              -Filter node.exe `
+              -Recurse |
+            Select-Object -First 1
+
+
+          if ($null -eq $nodeExe) {
+            throw "node.exe not found"
+          }
+
+
+          $target =
+            "portable\node"
+
+
+          New-Item `
+            -ItemType Directory `
+            -Path $target `
+            -Force | Out-Null
+
+
+          Copy-Item `
+            $nodeExe.FullName `
+            "$target\node.exe" `
+            -Force
+
+
+          Write-Host "Portable Node.js copied."
+
+
+      # ==========================================================
+      # Test portable Node
+      # ==========================================================
+
+      - name: Test portable Node.js
+        shell: pwsh
+        run: |
+          $node =
+            (Resolve-Path "portable\node\node.exe").Path
+
+          Write-Host "Testing portable Node.js:"
+          Write-Host $node
+
+
+          & $node --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Portable Node.js failed"
+          }
+
+
+      # ==========================================================
+      # Verify PORTABLE package
+      # ==========================================================
+
+      - name: Verify portable package
+        shell: pwsh
+        run: |
+          $required = @(
+            "portable\KSeFPDFGenerator.exe",
+            "portable\generate-pdf-wrapper.mjs",
+            "portable\node\node.exe",
+            "portable\Externals\ksef-pdf-generator\package.json",
+            "portable\Externals\ksef-pdf-generator\node_modules",
+            "portable\Externals\ksef-pdf-generator\dist\ksef-fe-invoice-converter.js",
+            "portable\Externals\ksef-pdf-generator\assets\invoice.xml"
+          )
+
+          foreach ($path in $required) {
+
+            if (!(Test-Path $path)) {
+              throw "Missing: $path"
+            }
+
+            Write-Host "[OK] $path"
+          }
+
+
+      # ==========================================================
+      # Test PORTABLE package
+      # ==========================================================
+
+      - name: Test portable package
+        shell: pwsh
+        run: |
+          $testDir =
+            Join-Path $env:RUNNER_TEMP "ksef-pdf-test-portable"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $testDir `
+            -Force | Out-Null
+
+
+          $sourceXml =
+            "portable\Externals\ksef-pdf-generator\assets\invoice.xml"
+
+          $xml =
+            Join-Path $testDir "invoice.xml"
+
+          Copy-Item `
+            $sourceXml `
+            $xml `
+            -Force
+
+
+          $exe =
+            (Resolve-Path "portable\KSeFPDFGenerator.exe").Path
+
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "Testing PORTABLE package"
+          Write-Host "=========================================="
+
+
+          Write-Host "Bundled Node.js:"
+          & (Resolve-Path "portable\node\node.exe").Path --version
+
+
+          Push-Location portable
+
+          try {
+
+            & $exe "faktura" $xml
+
+            $exitCode = $LASTEXITCODE
+
+          }
+          finally {
+
+            Pop-Location
+
+          }
+
+
+          Write-Host "Exit code: $exitCode"
+
+          if ($exitCode -ne 0) {
+            throw "Portable KSeFPDFGenerator failed with exit code $exitCode"
+          }
+
+
+          $pdf =
+            Join-Path $testDir "invoice.pdf"
+
+
+          if (!(Test-Path $pdf)) {
+            throw "Portable package did not generate PDF"
+          }
+
+
+          $file = Get-Item $pdf
+
+          Write-Host "PDF:"
+          Write-Host $file.FullName
+
+          Write-Host "Size:"
+          Write-Host "$($file.Length) bytes"
+
+
+          if ($file.Length -lt 1000) {
+            throw "PDF is suspiciously small"
+          }
+
+
+          $bytes =
+            [System.IO.File]::ReadAllBytes($pdf)
+
+
+          if ($bytes.Length -lt 5) {
+            throw "PDF is too small"
+          }
+
+
+          $header =
+            [System.Text.Encoding]::ASCII.GetString(
+              $bytes,
+              0,
+              5
+            )
+
+
+          Write-Host "Header: $header"
+
+
+          if ($header -ne "%PDF-") {
+            throw "Invalid PDF header: $header"
+          }
+
+
+          Write-Host ""
+          Write-Host "PORTABLE PACKAGE TEST PASSED"
+
+
+      # ==========================================================
+      # Upload PORTABLE test PDF
+      # ==========================================================
+
+      - name: Upload portable test PDF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-pdf-portable
+          path: ${{ runner.temp }}/ksef-pdf-test-portable/invoice.pdf
+          if-no-files-found: warn
+
+
+      # ==========================================================
+      # Create NORMAL ZIP
+      # ==========================================================
+
+      - name: Create normal ZIP
+        shell: pwsh
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          $zip =
+            "KSeFPDFGenerator-$env:SHA-win-x64.zip"
+
+
+          Compress-Archive `
+            -Path "publish\*" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
+
+
+          Write-Host ""
+          Write-Host "Created NORMAL package:"
+          Write-Host $zip
+
+
+      # ==========================================================
+      # Create PORTABLE ZIP
+      # ==========================================================
+
+      - name: Create portable ZIP
+        shell: pwsh
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          $zip =
+            "KSeFPDFGenerator-$env:SHA-portable-win-x64.zip"
+
+
+          Compress-Archive `
+            -Path "portable\*" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
+
+
+          Write-Host ""
+          Write-Host "Created PORTABLE package:"
+          Write-Host $zip
+
+
+      # ==========================================================
+      # Show package sizes
+      # ==========================================================
+
+      - name: Show package sizes
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "PACKAGE SIZES"
+          Write-Host "=========================================="
+
+          Get-Item "KSeFPDFGenerator-*.zip" |
+            Select-Object Name, Length |
+            Format-Table -AutoSize
+
+
+      # ==========================================================
+      # Upload both ZIPs as workflow artifact
+      # ==========================================================
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KSeFPDFGenerator-win-x64
+          path: |
+            KSeFPDFGenerator-*-win-x64.zip
+            KSeFPDFGenerator-*-portable-win-x64.zip
+          retention-days: 30
+
+
+      # ==========================================================
+      # Create GitHub Release
+      # ==========================================================
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ needs.check.outputs.sha }}
+          name: KSeFPDFGenerator ${{ needs.check.outputs.sha }}
+
+          body: |
+            # KSeF PDF Generator
+
+            Generator commit:
+            `${{ needs.check.outputs.sha }}`
+
+            Platform:
+            Windows x64
+
+            ## Packages
+
+            ### KSeFPDFGenerator-<SHA>-win-x64.zip
+
+            Standard version.
+
+            Contains:
+            - KSeFPDFGenerator.exe
+            - self-contained .NET runtime
+            - ksef-pdf-generator
+            - node_modules
+            - generate-pdf-wrapper.mjs
+
+            Requires:
+            - Node.js available in PATH
+
+            ### KSeFPDFGenerator-<SHA>-portable-win-x64.zip
+
+            Portable version.
+
+            Contains:
+            - KSeFPDFGenerator.exe
+            - self-contained .NET runtime
+            - ksef-pdf-generator
+            - node_modules
+            - generate-pdf-wrapper.mjs
+            - bundled Node.js
+
+            Does NOT require:
+            - Node.js installation
+
+            ## Tests
+
+            Both packages are automatically tested by generating a PDF from the
+            sample invoice.xml.
+
+          files: |
+            KSeFPDFGenerator-${{ needs.check.outputs.sha }}-win-x64.zip
+            KSeFPDFGenerator-${{ needs.check.outputs.sha }}-portable-win-x64.zip
+
+          generate_release_notes: true
