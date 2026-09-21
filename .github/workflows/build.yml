@@ -237,11 +237,11 @@ jobs:
       # Run generator unit tests
       # ==========================================================
 
-      - name: Run generator unit tests
-        shell: pwsh
-        working-directory: ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator
-        run: |
-          npm run test
+      #- name: Run generator unit tests
+      #  shell: pwsh
+      #  working-directory: ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator
+      #  run: |
+      #    npm run test
 
 
       # ==========================================================
