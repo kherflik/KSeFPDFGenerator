@@ -1,4 +1,4 @@
-name: Build KSeF PDF Generator - main
+name: Build KSeF PDF Generator - release
 
 on:
   workflow_dispatch:
@@ -19,36 +19,63 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      sha: ${{ steps.generator.outputs.sha }}
+      version: ${{ steps.generator.outputs.version }}
+      release_tag: ${{ steps.generator.outputs.release_tag }}
       should_build: ${{ steps.release.outputs.should_build }}
 
     steps:
 
-      - name: Get latest generator SHA
+      # ==========================================================
+      # Get latest upstream Release
+      # ==========================================================
+
+      - name: Get latest generator release
         id: generator
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          SHA=$(git ls-remote \
-            https://github.com/CIRFMF/ksef-pdf-generator.git \
-            refs/heads/main | cut -f1)
+          RELEASE_TAG=$(gh release view \
+            --repo CIRFMF/ksef-pdf-generator \
+            --json tagName \
+            --jq '.tagName')
 
-          if [ -z "$SHA" ]; then
-            echo "Cannot determine generator SHA"
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "Cannot determine latest generator release"
             exit 1
           fi
 
-          echo "Generator SHA: $SHA"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          # Normally the tag is for example:
+          #   1.1.40
+          #
+          # Also support tags like:
+          #   release/1.1.40
+          VERSION="${RELEASE_TAG#release/}"
 
+          if [ -z "$VERSION" ]; then
+            echo "Cannot determine generator version"
+            exit 1
+          fi
+
+          echo "Generator release tag: $RELEASE_TAG"
+          echo "Generator version: $VERSION"
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+
+      # ==========================================================
+      # Check whether this version was already built
+      # ==========================================================
 
       - name: Check release
         id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.generator.outputs.sha }}
+          VERSION: ${{ steps.generator.outputs.version }}
         run: |
-          TAG="build-$SHA"
+          TAG="build-$VERSION"
 
           if gh release view "$TAG" \
             --repo "${{ github.repository }}" \
@@ -90,8 +117,31 @@ jobs:
           repository: CIRFMF/ksef-client-csharp
           ref: main
           path: ksef-client-csharp
-          submodules: recursive
+          submodules: false
           fetch-depth: 1
+
+
+      # ==========================================================
+      # Remove generator submodule directory
+      # ==========================================================
+
+      - name: Remove generator submodule
+        shell: pwsh
+        run: |
+          $generator =
+            "ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator"
+
+          if (Test-Path $generator) {
+            Write-Host "Removing existing generator directory:"
+            Write-Host $generator
+
+            Remove-Item `
+              $generator `
+              -Recurse `
+              -Force
+          }
+
+          Write-Host "Generator directory is ready."
 
 
       # ==========================================================
@@ -116,27 +166,60 @@ jobs:
 
 
       # ==========================================================
-      # Checkout exact generator commit
+      # Checkout exact generator Release
       # ==========================================================
 
-      - name: Checkout generator commit
+      - name: Checkout ksef-pdf-generator release
+        uses: actions/checkout@v4
+        with:
+          repository: CIRFMF/ksef-pdf-generator
+          ref: ${{ needs.check.outputs.release_tag }}
+          path: ksef-client-csharp/KSeF.Client.Tests.PdfTestApp/Externals/ksef-pdf-generator
+          fetch-depth: 1
+
+
+      # ==========================================================
+      # Verify generator Release
+      # ==========================================================
+
+      - name: Verify generator release
         shell: pwsh
-        working-directory: ksef-client-csharp
         env:
-          GENERATOR_SHA: ${{ needs.check.outputs.sha }}
+          EXPECTED_TAG: ${{ needs.check.outputs.release_tag }}
+          EXPECTED_VERSION: ${{ needs.check.outputs.version }}
         run: |
           $generator =
-            "KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator"
+            "ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator"
 
-          Write-Host "Generator SHA:"
-          Write-Host $env:GENERATOR_SHA
+          Write-Host "Expected release tag:"
+          Write-Host $env:EXPECTED_TAG
 
-          git -C $generator fetch origin $env:GENERATOR_SHA
+          Write-Host "Expected version:"
+          Write-Host $env:EXPECTED_VERSION
 
-          git -C $generator checkout $env:GENERATOR_SHA
+          $actualTag =
+            (git -C $generator describe --tags --exact-match HEAD 2>$null).Trim()
 
-          Write-Host "Checked out:"
-          git -C $generator rev-parse HEAD
+          if ([string]::IsNullOrWhiteSpace($actualTag)) {
+            Write-Host "Unable to determine exact tag using git describe."
+
+            Write-Host "Current commit:"
+            git -C $generator rev-parse HEAD
+
+            Write-Host "Available tags:"
+            git -C $generator tag --points-at HEAD
+
+            throw "Generator release tag could not be verified."
+          }
+
+          Write-Host "Actual tag:"
+          Write-Host $actualTag
+
+          if ($actualTag -ne $env:EXPECTED_TAG) {
+            throw "Generator release tag mismatch!"
+          }
+
+          Write-Host "[OK] Generator release verified."
 
 
       # ==========================================================
@@ -148,6 +231,17 @@ jobs:
         working-directory: ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator
         run: |
           npm ci
+
+
+      # ==========================================================
+      # Run generator unit tests
+      # ==========================================================
+
+      - name: Run generator unit tests
+        shell: pwsh
+        working-directory: ksef-client-csharp\KSeF.Client.Tests.PdfTestApp\Externals\ksef-pdf-generator
+        run: |
+          npm run test
 
 
       # ==========================================================
@@ -228,7 +322,7 @@ jobs:
           # Optional bundled Node.js
           #
           # Normal package:
-          #   .\node\node.exe does not exist
+          #   .\node\ does not exist
           #   -> system Node.js from PATH
           #
           # Portable package:
@@ -832,10 +926,10 @@ jobs:
       - name: Create normal ZIP
         shell: pwsh
         env:
-          SHA: ${{ needs.check.outputs.sha }}
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           $zip =
-            "KSeFPDFGenerator-$env:SHA-win-x64.zip"
+            "KSeFPDFGenerator-$env:VERSION-win-x64.zip"
 
 
           Compress-Archive `
@@ -856,10 +950,10 @@ jobs:
       - name: Create portable ZIP
         shell: pwsh
         env:
-          SHA: ${{ needs.check.outputs.sha }}
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           $zip =
-            "KSeFPDFGenerator-$env:SHA-portable-win-x64.zip"
+            "KSeFPDFGenerator-$env:VERSION-portable-win-x64.zip"
 
 
           Compress-Archive `
@@ -910,22 +1004,31 @@ jobs:
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          GENERATOR_TAG: ${{ needs.check.outputs.release_tag }}
         with:
-          tag_name: build-${{ needs.check.outputs.sha }}
-          name: KSeFPDFGenerator ${{ needs.check.outputs.sha }}
+          tag_name: build-${{ needs.check.outputs.version }}
+          name: KSeFPDFGenerator ${{ needs.check.outputs.version }}
 
           body: |
             # KSeF PDF Generator
 
-            Generator commit:
-            `${{ needs.check.outputs.sha }}`
+            KSeF PDF Generator version:
+            `${{ needs.check.outputs.version }}`
+
+            Upstream repository:
+            `CIRFMF/ksef-pdf-generator`
+
+            Upstream release/tag:
+            `${{ needs.check.outputs.release_tag }}`
 
             Platform:
             Windows x64
 
             ## Packages
 
-            ### KSeFPDFGenerator-<SHA>-win-x64.zip
+            ### KSeFPDFGenerator-${{ needs.check.outputs.version }}-win-x64.zip
 
             Standard version.
 
@@ -939,7 +1042,7 @@ jobs:
             Requires:
             - Node.js available in PATH
 
-            ### KSeFPDFGenerator-<SHA>-portable-win-x64.zip
+            ### KSeFPDFGenerator-${{ needs.check.outputs.version }}-portable-win-x64.zip
 
             Portable version.
 
@@ -954,13 +1057,35 @@ jobs:
             Does NOT require:
             - Node.js installation
 
+            ## Build
+
+            The generator was obtained directly from the upstream GitHub Release:
+
+            `${{ needs.check.outputs.release_tag }}`
+
+            Build steps:
+
+            1. `npm ci`
+            2. `npm run test`
+            3. `npm run build`
+            4. .NET self-contained publish
+            5. Normal package test
+            6. Portable package test
+
             ## Tests
 
-            Both packages are automatically tested by generating a PDF from the
-            sample invoice.xml.
+            Both packages are automatically tested by generating a PDF from:
+
+            `assets/invoice.xml`
+
+            The generated PDF must:
+            - exist
+            - be larger than 1000 bytes
+            - start with `%PDF-`
 
           files: |
-            KSeFPDFGenerator-${{ needs.check.outputs.sha }}-win-x64.zip
-            KSeFPDFGenerator-${{ needs.check.outputs.sha }}-portable-win-x64.zip
+            KSeFPDFGenerator-${{ needs.check.outputs.version }}-win-x64.zip
+            KSeFPDFGenerator-${{ needs.check.outputs.version }}-portable-win-x64.zip
 
           generate_release_notes: true
+
